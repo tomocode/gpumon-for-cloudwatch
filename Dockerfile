@@ -9,9 +9,9 @@ RUN apt-get -qq update && \
 
 COPY gpumon.py gpumon.py
 
-ENV interval 10
-ENV log_path /tmp/gpumon_stats
-ENV resolution 60
-ENV namespace GPU/Container
+ENV interval=10
+ENV log_path=/tmp/gpumon_stats
+ENV resolution=60
+ENV namespace=GPU/Container
 
-CMD python gpumon.py -i ${interval} -l ${log_path} -r ${resolution} -n ${namespace}
+CMD  ["/bin/sh", "-c", "python gpumon.py -i ${interval} -l ${log_path} -r ${resolution} -n ${namespace}"]

@@ -9,6 +9,7 @@ python gpumon.py -i {time interval sec} -l {path to log} -r {resolution} --n {na
 import requests
 import boto3
 import argparse
+import os
 
 from pynvml import (nvmlInit, nvmlDeviceGetCount, nvmlShutdown,
                     nvmlDeviceGetHandleByIndex, nvmlDeviceGetPowerUsage,
@@ -17,7 +18,6 @@ from pynvml import (nvmlInit, nvmlDeviceGetCount, nvmlShutdown,
 from datetime import datetime
 from time import sleep
 
-BASE_URL = 'http://169.254.169.254/latest/meta-data/'
 parser = argparse.ArgumentParser()
 parser.add_argument(
     '-i',
@@ -46,20 +46,46 @@ parser.add_argument('-n',
                     type=str,
                     help='namespace of cloudwatch (default: DeepLearning)')
 
+_ecs_metadata_cache = None
 
-def _get_cloudwatch_meta(instance_id, image_id, instance_type, gpu_number):
+
+def _get_ecs_metadata():
+    """Get ECS task metadata from ECS container metadata endpoint
+    """
+    global _ecs_metadata_cache
+    if _ecs_metadata_cache is not None:
+        return _ecs_metadata_cache
+
+    try:
+        # ECS container metadata endpoint v4
+        ECS_METADATA_URI = os.environ.get('ECS_CONTAINER_METADATA_URI_V4')
+        if ECS_METADATA_URI:
+            response = requests.get(ECS_METADATA_URI + '/task')
+            metadata = response.json()
+
+            _ecs_metadata_cache = {
+                'cluster': metadata.get('Cluster', 'unknown'),
+                'service': metadata.get('ServiceName', 'unknown'),
+                'availability_zone': metadata.get('AvailabilityZone', 'unknown')
+            }
+            return _ecs_metadata_cache
+    except Exception as e:
+        print(f"Failed to get ECS metadata: {e}")
+        _ecs_metadata_cache = {}
+    return _ecs_metadata_cache
+
+
+def _get_cloudwatch_meta():
+    """Get CloudWatch dimensions for ECS service level metrics
+    """
+    ecs_meta = _get_ecs_metadata()
+
     return [{
-        'Name': 'InstanceId',
-        'Value': instance_id
+        'Name': 'Cluster',
+        'Value': ecs_meta.get('cluster', 'unknown')
     }, {
-        'Name': 'ImageId',
-        'Value': image_id
-    }, {
-        'Name': 'InstanceType',
-        'Value': instance_type
-    }, {
-        'Name': 'GPUNumber',
-        'Value': str(gpu_number)
+        'Name': 'Service',
+        'Value': ecs_meta.get('service', 'unknown')
     }]
 
 
@@ -76,10 +102,6 @@ def _format_metric(name, value, resolution, dimension, unit='None'):
 def _put_log(string, file_path):
     with open(file_path, 'a+') as f:
         f.write(string)
-
-
-def _get_meta_data(meta_type):
-    return requests.get(BASE_URL + meta_type).text
 
 
 def get_gpu_power(handle):
@@ -115,13 +137,10 @@ def put_metrics_to_log_file(gpu_num, power, temp, utilization, log_path):
         print("Cannot print to %s, %s" % (log_path, e))
 
 
-def put_metrics_to_cloudwatch(gpu_num, power, temp, utilization, resolution,
-                              cloudwatch, namespace, instance_meta):
-    dimension = _get_cloudwatch_meta(
-        instance_id=instance_meta['instance_id'],
-        image_id=instance_meta['image_id'],
-        instance_type=instance_meta['instance_type'],
-        gpu_number=gpu_num)
+def put_metrics_to_cloudwatch(power, temp, utilization, resolution,
+                              cloudwatch, namespace):
+    """Update CloudWatch metrics with ECS context"""
+    dimension = _get_cloudwatch_meta()
 
     cloudwatch.put_metric_data(MetricData=[
         _format_metric('GPU Usage', utilization.gpu, resolution, dimension,
@@ -129,10 +148,9 @@ def put_metrics_to_cloudwatch(gpu_num, power, temp, utilization, resolution,
         _format_metric('Memory Usage', utilization.memory, resolution,
                        dimension, 'Percent'),
         _format_metric('Power Usage (Watts)', power, resolution, dimension),
-        _format_metric('Temperature (C)', temp, resolution, dimension,
-                       'Percent'),
+        _format_metric('Temperature (C)', temp, resolution, dimension),
     ],
-                               Namespace=namespace)
+        Namespace=namespace)
 
 
 def main():
@@ -143,15 +161,10 @@ def main():
     num_device = list(range(nvmlDeviceGetCount()))
     log_path = args.log_path + datetime.now().strftime('%Y-%m-%dT%H')
 
-    instance_meta = {
-        'instance_id': _get_meta_data('instance-id'),
-        'image_id': _get_meta_data('ami-id'),
-        'instance_type': _get_meta_data('instance-type'),
-        'region': _get_meta_data('placement/availability-zone')[:-1]
-    }
+    # インスタンスメタデータの取得を簡略化
+    region = _get_ecs_metadata().get('availability_zone', 'unknown')[:-1]
+    cloudwatch = boto3.client('cloudwatch', region_name=region)
 
-    cloudwatch = boto3.client('cloudwatch',
-                              region_name=instance_meta['region'])
     try:
         while True:
             for gpu_num in num_device:
@@ -169,14 +182,12 @@ def main():
                 if put_metric:
                     put_metrics_to_log_file(gpu_num, power, temp, utilization,
                                             log_path)
-                    put_metrics_to_cloudwatch(gpu_num=gpu_num,
-                                              power=power,
+                    put_metrics_to_cloudwatch(power=power,
                                               temp=temp,
                                               utilization=utilization,
                                               resolution=args.resolution,
                                               cloudwatch=cloudwatch,
-                                              namespace=args.namespace,
-                                              instance_meta=instance_meta)
+                                              namespace=args.namespace)
 
             sleep(args.interval)
     finally:
